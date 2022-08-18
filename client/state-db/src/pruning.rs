@@ -255,7 +255,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 					cache.push_back(row);
 					loaded += 1;
 				},
-				None => break,
+				None => trace!(target: "state-db", "unexpect None while loading block from db. base #{}, start {}, current {}, uncached_blocks {}, batch_size {}", base, start, i, uncached_blocks, batch_size),
 			}
 		}
 		// `loaded` should be the same as what we expect, if there are missing blocks
