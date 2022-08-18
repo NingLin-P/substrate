@@ -120,7 +120,6 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 		// number keep most common ops in cache
 		let cache_capacity = window_size.min(DEFAULT_MAX_BLOCK_CONSTRAINT) as usize + 10;
 		let mut cache = VecDeque::with_capacity(cache_capacity);
-		trace!(target: "state-db", "Reading pruning journal for the database-backed queue. Pending #{}", base);
 		// Load block from db
 		DeathRowQueue::load_batch_from_db(
 			&db,
@@ -129,6 +128,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 			base,
 			cache_capacity,
 		)?;
+		trace!(target: "state-db", "Reading pruning journal for the database-backed queue. Pending #{}, cache_capacity {}, cached {}, uncached_blocks {}", base, cache_capacity, cache.len(), uncached_blocks);
 		Ok(DeathRowQueue::DbBacked { db, cache, cache_capacity, uncached_blocks })
 	}
 
@@ -137,13 +137,19 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 		let JournalRecord { hash, inserted, deleted } = journal_record;
 		match self {
 			DeathRowQueue::DbBacked { uncached_blocks, cache, cache_capacity, .. } => {
+				let mut to_cache = false;
 				// `uncached_blocks` is zero means currently all block are loaded into `cache`
 				// thus if `cache` is not full, load the next block into `cache` too
 				if *uncached_blocks == 0 && cache.len() < *cache_capacity {
-					cache.push_back(DeathRow { hash, deleted: deleted.into_iter().collect() });
+					cache.push_back(DeathRow {
+						hash: hash.clone(),
+						deleted: deleted.into_iter().collect(),
+					});
+					to_cache = true;
 				} else {
 					*uncached_blocks += 1;
 				}
+				trace!(target: "state-db", "import into db queue. block {:?}, to_cache {}, cached {}, uncached_blocks {}", hash, to_cache, cache.len(), uncached_blocks);
 			},
 			DeathRowQueue::Mem { death_rows, death_index } => {
 				// remove all re-inserted keys from death rows
@@ -200,6 +206,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 		debug_assert!(amout <= self.len());
 		match self {
 			DeathRowQueue::DbBacked { uncached_blocks, cache, .. } => {
+				trace!(target: "state-db", "revert_recent_add, base {}, amout {}, cached {}, uncached_blocks {}", base, amout, cache.len(), uncached_blocks);
 				// remove from `uncached_blocks` if it can cover
 				if *uncached_blocks >= amout {
 					*uncached_blocks -= amout;
@@ -236,6 +243,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 		// return if all blocks already loaded into `cache` and there are no other
 		// blocks in the backend database
 		if *uncached_blocks == 0 {
+			trace!(target: "state-db", "return early from load_batch_from_db. base #{}, cached {}, uncached_blocks {}", base, cache.len(), uncached_blocks);
 			return Ok(())
 		}
 		let start = base + cache.len() as u64;
@@ -254,6 +262,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 		// `load_death_row_from_db` should return a db error
 		debug_assert_eq!(batch_size, loaded);
 		*uncached_blocks -= loaded;
+		trace!(target: "state-db", "Loading batch of block from db. base #{}, cached {}, uncached_blocks {}, loaded {}", base, cache.len(), uncached_blocks, loaded);
 		Ok(())
 	}
 
@@ -282,6 +291,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 						// because `cache` is a queue of successive `DeathRow`
 						// NOTE: this branch should not be entered because blocks are visited
 						// in successive increasing order, just keeping it for robustness
+						trace!(target: "state-db", "Loading single from db. base #{}, cached {}, uncached_blocks {}, index {}", base, cache.len(), uncached_blocks, index);
 						return load_death_row_from_db(db, base + index as u64)
 					}
 				}
@@ -476,9 +486,13 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> RefWindow<BlockHash, Key, D> {
 
 	/// Prune next block. Expects at least one block in the window. Adds changes to `commit`.
 	pub fn prune_one(&mut self, commit: &mut CommitSet<Key>) -> Result<(), Error<D::Error>> {
-		if let Some(pruned) = self.queue.get(self.base, self.pending_prunings)? {
-			trace!(target: "state-db", "Pruning {:?} ({} deleted)", pruned.hash, pruned.deleted.len());
+		let res = self.queue.get(self.base, self.pending_prunings);
+		if res.is_err() {
+			trace!(target: "state-db", "error when getting block {:?}, base {}, pending_prunings {})", res, self.base, self.pending_prunings);
+		}
+		if let Some(pruned) = res? {
 			let index = self.base + self.pending_prunings as u64;
+			trace!(target: "state-db", "Pruning {:?}@{} ({} deleted)", pruned.hash, index, pruned.deleted.len());
 			commit.data.deleted.extend(pruned.deleted.into_iter());
 			commit.meta.inserted.push((to_meta_key(LAST_PRUNED, &()), index.encode()));
 			commit
@@ -487,6 +501,12 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> RefWindow<BlockHash, Key, D> {
 				.push(to_journal_key(self.base + self.pending_prunings as u64));
 			self.pending_prunings += 1;
 		} else {
+			match &self.queue {
+				DeathRowQueue::DbBacked { cache, uncached_blocks, cache_capacity, .. } => {
+					warn!(target: "state-db", "Trying to prune when there's nothing to prune, base {}, pending_prunings {}, cached {}, uncached_blocks {}, cache_capacity {}", self.base, self.pending_prunings, cache.len(), uncached_blocks, cache_capacity);
+				},
+				_ => {},
+			}
 			warn!(target: "state-db", "Trying to prune when there's nothing to prune");
 		}
 		Ok(())
@@ -505,7 +525,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> RefWindow<BlockHash, Key, D> {
 		} else if (self.base + self.queue.len() as u64) != number {
 			return Err(Error::StateDb(StateDbError::InvalidBlockNumber))
 		}
-		trace!(target: "state-db", "Adding to pruning window: {:?} ({} inserted, {} deleted)", hash, commit.data.inserted.len(), commit.data.deleted.len());
+		trace!(target: "state-db", "Adding to pruning window: {:?}@{} ({} inserted, {} deleted)", hash, number, commit.data.inserted.len(), commit.data.deleted.len());
 		let inserted = if matches!(self.queue, DeathRowQueue::Mem { .. }) {
 			commit.data.inserted.iter().map(|(k, _)| k.clone()).collect()
 		} else {
@@ -521,6 +541,12 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> RefWindow<BlockHash, Key, D> {
 
 	/// Apply all pending changes
 	pub fn apply_pending(&mut self) {
+		match &self.queue {
+			DeathRowQueue::DbBacked { cache, uncached_blocks, .. } => {
+				warn!(target: "state-db", "begin apply pending, base {}, pending_prunings {}, pending_canonicalizations {}, cached {}, uncached_blocks {}", self.base, self.pending_prunings, self.pending_canonicalizations, cache.len(), uncached_blocks);
+			},
+			_ => {},
+		}
 		self.pending_canonicalizations = 0;
 		for _ in 0..self.pending_prunings {
 			let pruned = self
@@ -539,6 +565,7 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> RefWindow<BlockHash, Key, D> {
 
 	/// Revert all pending changes
 	pub fn revert_pending(&mut self) {
+		trace!(target: "state-db", "revert_pending, base {}, pending_canonicalizations {}, pending_prunings {}", self.base, self.pending_canonicalizations, self.pending_prunings);
 		self.queue.revert_recent_add(self.base, self.pending_canonicalizations);
 		self.pending_canonicalizations = 0;
 		self.pending_prunings = 0;
