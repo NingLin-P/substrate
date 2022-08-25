@@ -29,7 +29,7 @@ use crate::{
 	DEFAULT_MAX_BLOCK_CONSTRAINT,
 };
 use codec::{Decode, Encode};
-use log::{trace, warn};
+use log::{error, trace, warn};
 use std::{
 	cmp,
 	collections::{HashMap, HashSet, VecDeque},
@@ -116,9 +116,8 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 		mut uncached_blocks: usize,
 		window_size: u32,
 	) -> Result<DeathRowQueue<BlockHash, Key, D>, Error<D::Error>> {
-		// The pruning window size (if not larger than `DEFAULT_MAX_BLOCK_CONSTRAINT`) plus a magic
-		// number keep most common ops in cache
-		let cache_capacity = window_size.min(DEFAULT_MAX_BLOCK_CONSTRAINT) as usize + 10;
+		// limit the cache capacity from 1 to `DEFAULT_MAX_BLOCK_CONSTRAINT`
+		let cache_capacity = window_size.max(1).min(DEFAULT_MAX_BLOCK_CONSTRAINT) as usize;
 		let mut cache = VecDeque::with_capacity(cache_capacity);
 		// Load block from db
 		DeathRowQueue::load_batch_from_db(
@@ -255,12 +254,10 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 					cache.push_back(row);
 					loaded += 1;
 				},
-				None => trace!(target: "state-db", "unexpect None while loading block from db. base #{}, start {}, current {}, uncached_blocks {}, batch_size {}", base, start, i, uncached_blocks, batch_size),
+				None =>
+					trace!(target: "state-db", "unexpect None while loading block from db. base #{}, start {}, current {}, uncached_blocks {}, batch_size {}", base, start, i, uncached_blocks, batch_size),
 			}
 		}
-		// `loaded` should be the same as what we expect, if there are missing blocks
-		// `load_death_row_from_db` should return a db error
-		debug_assert_eq!(batch_size, loaded);
 		*uncached_blocks -= loaded;
 		trace!(target: "state-db", "Loading batch of block from db. base #{}, cached {}, uncached_blocks {}, loaded {}", base, cache.len(), uncached_blocks, loaded);
 		Ok(())
@@ -298,20 +295,6 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> DeathRowQueue<BlockHash, Key, D> {
 				Ok(cache.get(index).cloned())
 			},
 			DeathRowQueue::Mem { death_rows, .. } => Ok(death_rows.get(index).cloned()),
-		}
-	}
-
-	/// Get the hash of the block at the given `index` of the queue  
-	fn get_hash(&mut self, base: u64, index: usize) -> Result<Option<BlockHash>, Error<D::Error>> {
-		match self {
-			DeathRowQueue::DbBacked { cache, .. } =>
-				if index < cache.len() {
-					Ok(cache.get(index).map(|r| r.hash.clone()))
-				} else {
-					self.get(base, index).map(|r| r.map(|r| r.hash))
-				},
-			DeathRowQueue::Mem { death_rows, .. } =>
-				Ok(death_rows.get(index).map(|r| r.hash.clone())),
 		}
 	}
 
@@ -455,8 +438,19 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> RefWindow<BlockHash, Key, D> {
 		(self.queue.len() - self.pending_prunings) as u64
 	}
 
+	/// Get the hash of the next pruning block
 	pub fn next_hash(&mut self) -> Result<Option<BlockHash>, Error<D::Error>> {
-		self.queue.get_hash(self.base, self.pending_prunings)
+		let res = match &self.queue {
+			DeathRowQueue::DbBacked { cache, .. } =>
+				if self.pending_prunings < cache.len() {
+					cache.get(self.pending_prunings).map(|r| r.hash.clone())
+				} else {
+					self.get(self.pending_prunings)?.map(|r| r.hash)
+				},
+			DeathRowQueue::Mem { death_rows, .. } =>
+				death_rows.get(self.pending_prunings).map(|r| r.hash.clone()),
+		};
+		Ok(res)
 	}
 
 	pub fn mem_used(&self) -> usize {
@@ -484,9 +478,33 @@ impl<BlockHash: Hash, Key: Hash, D: MetaDb> RefWindow<BlockHash, Key, D> {
 		self.queue.have_block(hash, (number - self.base) as usize)
 	}
 
+	fn get(&mut self, index: usize) -> Result<Option<DeathRow<BlockHash, Key>>, Error<D::Error>> {
+		if index >= self.queue.len() {
+			return Ok(None)
+		}
+		match self.queue.get(self.base, index)? {
+			None => {
+				if matches!(self.queue, DeathRowQueue::DbBacked { .. }) &&
+					// whether trying to get a pending canonicalize block which may not commit to the db yet
+					index >= self.queue.len() - self.pending_canonicalizations
+				{
+					trace!(target: "state-db", "Trying to get a pending canonicalize block that not commit to the db yet");
+					Err(Error::StateDb(StateDbError::BlockUnavailable))
+				} else {
+					// A block of the queue is missing, this may happen if `CommitSet` are commit to
+					// db concurrently and calling `apply_pending/revert_pending` out of order, this
+					// should not happen under current implementation but keeping it as a defensive
+					error!(target: "state-db", "Block record is missing from the pruning window, block number {}", self.base + index as u64);
+					Err(Error::StateDb(StateDbError::BlockMissing))
+				}
+			},
+			s => Ok(s),
+		}
+	}
+
 	/// Prune next block. Expects at least one block in the window. Adds changes to `commit`.
 	pub fn prune_one(&mut self, commit: &mut CommitSet<Key>) -> Result<(), Error<D::Error>> {
-		let res = self.queue.get(self.base, self.pending_prunings);
+		let res = self.get(self.pending_prunings);
 		if res.is_err() {
 			trace!(target: "state-db", "error when getting block {:?}, base {}, pending_prunings {})", res, self.base, self.pending_prunings);
 		}
@@ -578,7 +596,7 @@ mod tests {
 	use crate::{
 		noncanonical::LAST_CANONICAL,
 		test::{make_commit, make_db, TestDb},
-		to_meta_key, CommitSet, Hash, DEFAULT_MAX_BLOCK_CONSTRAINT,
+		to_meta_key, CommitSet, Error, Hash, StateDbError, DEFAULT_MAX_BLOCK_CONSTRAINT,
 	};
 	use codec::Encode;
 	use sp_core::H256;
@@ -865,7 +883,7 @@ mod tests {
 		let mut db = make_db(&[]);
 		let mut pruning: RefWindow<u64, H256, TestDb> =
 			RefWindow::new(db.clone(), DEFAULT_MAX_BLOCK_CONSTRAINT, false).unwrap();
-		let cache_capacity = DEFAULT_MAX_BLOCK_CONSTRAINT as usize + 10;
+		let cache_capacity = DEFAULT_MAX_BLOCK_CONSTRAINT as usize;
 
 		// start as an empty queue
 		let (cache, uncached_blocks) = pruning.queue.get_db_backed_queue_state().unwrap();
@@ -949,7 +967,7 @@ mod tests {
 		let mut db = make_db(&[]);
 		let mut pruning: RefWindow<u64, H256, TestDb> =
 			RefWindow::new(db.clone(), DEFAULT_MAX_BLOCK_CONSTRAINT, false).unwrap();
-		let cache_capacity = DEFAULT_MAX_BLOCK_CONSTRAINT as usize + 10;
+		let cache_capacity = DEFAULT_MAX_BLOCK_CONSTRAINT as usize;
 
 		// import blocks
 		for i in 0..(cache_capacity as u64 * 2 + 10) {
@@ -1010,5 +1028,53 @@ mod tests {
 		for i in 0..10 {
 			assert_eq!(cache[i].hash, (cache_capacity * 2 + i) as u64);
 		}
+	}
+
+	#[test]
+	fn get_block_from_queue() {
+		let mut db = make_db(&[]);
+		let mut pruning: RefWindow<u64, H256, TestDb> =
+			RefWindow::new(db.clone(), DEFAULT_MAX_BLOCK_CONSTRAINT, false).unwrap();
+		let cache_capacity = DEFAULT_MAX_BLOCK_CONSTRAINT as u64;
+
+		// import blocks and commit to db
+		let mut commit = make_commit(&[], &[]);
+		for i in 0..(cache_capacity + 10) {
+			pruning.note_canonical(&i, i, &mut commit).unwrap();
+		}
+		db.commit(&commit);
+
+		// import a block but not commit to db yet
+		let mut pending_commit = make_commit(&[], &[]);
+		let index = cache_capacity + 10;
+		pruning.note_canonical(&index, index, &mut pending_commit).unwrap();
+
+		let mut commit = make_commit(&[], &[]);
+		// prune blocks that had committed to db
+		for i in 0..(cache_capacity + 10) {
+			assert_eq!(pruning.next_hash().unwrap(), Some(i));
+			pruning.prune_one(&mut commit).unwrap();
+		}
+		// return `BlockUnavailable` for block that did not commit to db
+		assert_eq!(
+			pruning.next_hash().unwrap_err(),
+			Error::StateDb(StateDbError::BlockUnavailable)
+		);
+		assert_eq!(
+			pruning.prune_one(&mut commit).unwrap_err(),
+			Error::StateDb(StateDbError::BlockUnavailable)
+		);
+		// commit block to db and no error return
+		db.commit(&pending_commit);
+		assert_eq!(pruning.next_hash().unwrap(), Some(index));
+		pruning.prune_one(&mut commit).unwrap();
+		db.commit(&commit);
+
+		// import a block and do not commit it to db before calling `apply_pending`
+		pruning
+			.note_canonical(&(index + 1), index + 1, &mut make_commit(&[], &[]))
+			.unwrap();
+		pruning.apply_pending();
+		assert_eq!(pruning.next_hash().unwrap_err(), Error::StateDb(StateDbError::BlockMissing));
 	}
 }
