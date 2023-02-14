@@ -1336,27 +1336,14 @@ where
 
 	fn append_debug_buffer(&mut self, msg: &str) -> bool {
 		if let Some(buffer) = &mut self.debug_message {
-			let mut msg = msg.bytes();
-			let num_drain = {
-				let capacity = DebugBufferVec::<T>::bound().checked_sub(buffer.len()).expect(
-					"
-					`buffer` is of type `DebugBufferVec`,
-					`DebugBufferVec` is a `BoundedVec`,
-					`BoundedVec::len()` <= `BoundedVec::bound()`;
-					qed
-				",
-				);
-				msg.len().saturating_sub(capacity).min(buffer.len())
-			};
-			buffer.drain(0..num_drain);
 			buffer
-				.try_extend(&mut msg)
+				.try_extend(&mut msg.bytes())
 				.map_err(|_| {
 					log::debug!(
 						target: "runtime::contracts",
-						"Debug message to big (size={}) for debug buffer (bound={})",
-						msg.len(), DebugBufferVec::<T>::bound(),
-					);
+						"Debug buffer (of {} bytes) exhausted!",
+						DebugBufferVec::<T>::bound(),
+					)
 				})
 				.ok();
 			true
@@ -2054,9 +2041,9 @@ mod tests {
 	#[test]
 	fn code_hash_returns_proper_values() {
 		let code_bob = MockLoader::insert(Call, |ctx, _| {
-			// ALICE is not a contract and hence she does not have a code_hash
+			// ALICE is not a contract and hence they do not have a code_hash
 			assert!(ctx.ext.code_hash(&ALICE).is_none());
-			// BOB is a contract and hence he has a code_hash
+			// BOB is a contract and hence it has a code_hash
 			assert!(ctx.ext.code_hash(&BOB).is_some());
 			exec_success()
 		});
@@ -2601,9 +2588,11 @@ mod tests {
 			exec_success()
 		});
 
-		// Pre-fill the buffer up to its limit
-		let mut debug_buffer =
-			DebugBufferVec::<Test>::try_from(vec![0u8; DebugBufferVec::<Test>::bound()]).unwrap();
+		// Pre-fill the buffer almost up to its limit, leaving not enough space to the message
+		let debug_buf_before =
+			DebugBufferVec::<Test>::try_from(vec![0u8; DebugBufferVec::<Test>::bound() - 5])
+				.unwrap();
+		let mut debug_buf_after = debug_buf_before.clone();
 
 		ExtBuilder::default().build().execute_with(|| {
 			let schedule: Schedule<Test> = <Test as Config>::Schedule::get();
@@ -2620,15 +2609,11 @@ mod tests {
 				&schedule,
 				0,
 				vec![],
-				Some(&mut debug_buffer),
+				Some(&mut debug_buf_after),
 				Determinism::Deterministic,
 			)
 			.unwrap();
-			assert_eq!(
-				&String::from_utf8(debug_buffer[DebugBufferVec::<Test>::bound() - 17..].to_vec())
-					.unwrap(),
-				"overflowing bytes"
-			);
+			assert_eq!(debug_buf_before, debug_buf_after);
 		});
 	}
 
@@ -3436,6 +3421,37 @@ mod tests {
 				None,
 				Determinism::Deterministic
 			));
+		});
+	}
+
+	/// This works even though random interface is deprecated, as the check to ban deprecated
+	/// functions happens in the wasm stack which is mocked for exec tests.
+	#[test]
+	fn randomness_works() {
+		let subject = b"nice subject".as_ref();
+		let code_hash = MockLoader::insert(Call, move |ctx, _| {
+			let rand = <Test as Config>::Randomness::random(subject);
+			assert_eq!(rand, ctx.ext.random(subject));
+			exec_success()
+		});
+
+		ExtBuilder::default().build().execute_with(|| {
+			let schedule = <Test as Config>::Schedule::get();
+			place_contract(&BOB, code_hash);
+
+			let mut storage_meter = storage::meter::Meter::new(&ALICE, Some(0), 0).unwrap();
+			let result = MockStack::run_call(
+				ALICE,
+				BOB,
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
+				&mut storage_meter,
+				&schedule,
+				0,
+				vec![],
+				None,
+				Determinism::Deterministic,
+			);
+			assert_matches!(result, Ok(_));
 		});
 	}
 }
